@@ -3,7 +3,7 @@
 一个基于**时间轮**的高性能资源容器，提供**空闲超时（滑动过期 / 租约）**语义：
 
 - 资源添加进来时附带一个存活时长（TTL）；
-- 每次使用（`Get`）会**自动续期**；
+- 每次使用（`Get`）会**记录访问时间**；
 - 超过存活时长未被使用，就**自动释放**该资源。
 
 > `lease`（租约）：`Set` 发租约，`Get` 续租，超时不续自动回收。
@@ -12,9 +12,9 @@
 ## 特性
 
 - **租约语义**：`Set` 发租约，`Get` 续租，超时不续自动回收。
+- **无锁读取**：`Get` 只对最后访问时间做一次原子写，零锁、零分配，不移动定时任务。
 - **无全局扫描**：过期检测由分层时间轮驱动，每格只处理一个槽位，O(1)，不存在类似 GC 的全表扫描卡顿。
-- **无锁续期**：`Get` 的续期是原子写 + 惰性重调度，零锁、零分配。
-- **续期节流**：可配置 `RenewInterval`，合并高频访问的无谓续期。
+- **访问合并**：可配置 `RenewInterval`，合并高频访问的无谓原子写。
 - **自动释放**：过期时回调 `OnEvict`，或 value 实现了 `io.Closer` 则自动 `Close`。
 - **线程安全**：并发读写经 `-race` 验证。
 - **泛型**：`Lease[K comparable, V any]`，零装箱。
@@ -22,7 +22,7 @@
 ## 快速开始
 
 ```go
-import "lease"
+import "github.com/ndsky1003/lease"
 
 func main() {
 	l := lease.New(func(key string, value *Conn) {
@@ -30,9 +30,9 @@ func main() {
 		value.Close()
 	})
 
-	l.Set("conn:1", conn, 5*time.Minute) // 存活 5 分钟
+	l.Set("conn:1", conn, 5*time.Minute) // 空闲存活 5 分钟
 
-	v, ok := l.Get("conn:1") // 命中并自动续期 5 分钟
+	v, ok := l.Get("conn:1") // 命中并记录访问（续租 5 分钟）
 
 	l.Delete("conn:1") // 主动释放
 
@@ -44,13 +44,23 @@ func main() {
 
 ```
 Set(key, v, 2天)   →  发租约，2 天后到期
-Get(key)           →  命中并续期，重新计时 2 天
+Get(key)           →  命中并续租，重新计时 2 天
 2 天没 Get          →  到期，OnEvict 自动释放
 再次 Set            →  重新加载并重新计时
 ```
 
 这是"空闲超时"（idle timeout）语义：资源在**最后一次使用**之后存活 `ttl` 时长，
 而不是在**添加**之后固定 `ttl` 到期。适合 session、连接池、玩家状态等场景。
+
+## 实现方式
+
+本库把"续租"从时间轮操作中剥离出来：
+
+- `Set` 时挂一个**定时检查任务**（`AfterFunc(ttl, ...)`），到期检查该元素是否仍应存在；
+- `Get` 只**原子更新最后访问时间**，不移动、不重建定时任务；
+- 定时任务到期时，若距最后访问已超过 `ttl`（空闲超时），则**释放资源并停掉该任务**；否则重新调度到剩余时间。
+
+这样 `Get` 完全无锁（一次 `atomic.Store`），避免了传统"续期即 Stop+AfterFunc"的高开销。
 
 ## API
 
@@ -61,7 +71,7 @@ func NewWithOptions[K comparable, V any](opts Options[K, V]) *Lease[K, V]
 
 // 操作
 func (l *Lease[K, V]) Set(key K, value V, ttl time.Duration) // ttl<=0 表示永不过期
-func (l *Lease[K, V]) Get(key K) (value V, ok bool)          // 命中并续期
+func (l *Lease[K, V]) Get(key K) (value V, ok bool)          // 命中并记录访问
 func (l *Lease[K, V]) Has(key K) bool
 func (l *Lease[K, V]) Delete(key K)
 func (l *Lease[K, V]) Len() int
@@ -75,11 +85,11 @@ type Options[K comparable, V any] struct {
 	Tick          time.Duration // 时间轮每格时长，默认 1 秒
 	WheelSize     int64         // 每层槽位数量，默认 64
 	OnEvict       func(K, V)    // 释放回调
-	RenewInterval time.Duration // 续期节流阈值，<=0 表示每次 Get 都续期
+	RenewInterval time.Duration // 访问合并阈值，<=0 表示每次 Get 都记录
 }
 ```
 
-`RenewInterval` 用于合并高频续期：距上次续期不足该值则跳过，避免频繁访问时的无谓原子写。
+`RenewInterval` 用于合并高频访问：距上次更新不足该值则跳过，避免频繁访问时的无谓原子写。
 代价是空闲超时最多产生该值的偏差（例如 TTL 2 天、阈值 10 分钟，实际释放时间在 2 天到 2 天 10 分钟之间）。
 
 ## 示例：玩家会话管理
@@ -104,7 +114,7 @@ func OnLogin(id string, p *Player) {
 }
 
 func OnAction(id string) *Player {
-	p, ok := players.Get(id) // 命中则自动续期 2 天
+	p, ok := players.Get(id) // 命中则自动续租 2 天
 	if !ok {
 		p = loadFromDB(id) // 已过期释放，重新加载
 		players.Set(id, p, 48*time.Hour)
@@ -117,25 +127,20 @@ func OnAction(id string) *Player {
 
 | 操作 | 机制 | 性能（Apple M1）|
 |------|------|----------------|
-| `Get`（读 + 续期） | 读锁 + 原子续期 | ~92 ns，0 分配，约 1100 万 QPS |
-| `Set` | 写锁 + 投递时间轮 | ~450 ns，约 220 万 QPS |
-| 过期释放 | 批量释放（整槽一次加锁） | 约 240 万/s |
+| `Get`（读 + 记录访问） | 读锁 + 原子写 | ~95 ns，0 分配，约 1000 万 QPS |
+| `Set` | 写锁 + 投递时间轮 | ~850 ns |
+| 过期释放 | 定时检查 + 释放 | 约 85 万/s |
 
-- 续期是**无锁**的：`timer.expiration` 为原子变量，`Get` 里一次 `Store` 即完成。
+- `Get` 的续租是**无锁**的：`lastAccess` 为原子变量，`Get` 里一次 `Store` 即完成。
 - 过期判定与释放均为原子操作 + 指针比较，无数据竞态（`-race` 通过）。
 
-## 原理：时间轮
+## 原理：分层时间轮
 
 过期检测用**分层时间轮**实现，避免"定时器堆/全表扫描"的全局开销：
 
 - 每层由若干槽位组成，一圈覆盖 `tick × wheelSize`，超出范围的定时任务投递到上层（上层 tick 等于当前层一圈），从而指数级扩大时间跨度。
 - 每格只处理当前一个槽位（O(1)），不随条目总数退化。
-- 本库内置两种实现，`Lease` 默认使用延迟队列版（无任务时零 CPU 空转）：
-
-| 文件 | 实现 | 说明 |
-|------|------|------|
-| `delay_timing_wheel.go` | `DelayTimingWheel` | 延迟队列（最小堆）按需唤醒，无任务零空转，**`Lease` 正在使用** |
-| `timing_wheel.go` | `TimingWheel` | 固定 ticker 逐格推进，更简单，供学习对照 |
+- 底层调度使用开源库 [`github.com/RussellLuo/timingwheel`](https://github.com/RussellLuo/timingwheel)（Kafka 分层时间轮的 Go 移植）。
 
 ## License
 
