@@ -149,6 +149,7 @@ func (l *Lease[K, V]) check(e *entry[K, V]) {
 		l.reschedule(e, time.Duration(remaining))
 		return
 	}
+	//get
 
 	// 已空闲超时，双重检查后再释放，避免与并发 Get 冲突。
 	l.mu.Lock()
@@ -165,7 +166,7 @@ func (l *Lease[K, V]) check(e *entry[K, V]) {
 	}
 	l.mu.Unlock()
 
-	// lastAccess 被并发更新，重新检查。
+	// lastAccess 被并发更新，重新检查。对应上面get那,有个请求进来了
 	l.check(e)
 }
 
