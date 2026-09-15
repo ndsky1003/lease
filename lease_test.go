@@ -96,32 +96,37 @@ func TestDeleteCancels(t *testing.T) {
 	}
 }
 
-func TestOverwriteDoesNotDoubleRelease(t *testing.T) {
+func TestOverwriteReleasesOldValue(t *testing.T) {
 	var released atomic.Int32
+	var last atomic.Value
 	c := NewWithOptions(Options[string, string]{
 		Tick: 5 * time.Millisecond,
 		OnEvict: func(key, value string) {
 			released.Add(1)
+			last.Store(value)
 		},
 	})
 	defer c.Stop()
 
 	c.Set("k", "v1", 30*time.Millisecond)
-	c.Set("k", "v2", 80*time.Millisecond)
+	c.Set("k", "v2", 80*time.Millisecond) // 覆盖时应立即释放 v1
 
-	// 等到 v2 过期后，应只释放最终值一次
-	waitFor(t, 2*time.Second, func() bool { return released.Load() == 1 })
+	// v1 被覆盖释放一次，v2 过期后再释放一次，共 2 次，不重复也不遗漏
+	waitFor(t, 2*time.Second, func() bool { return released.Load() == 2 })
 	time.Sleep(50 * time.Millisecond)
-	if released.Load() != 1 {
-		t.Fatalf("覆盖后应只释放最终值一次，实际 %d 次", released.Load())
+	if released.Load() != 2 {
+		t.Fatalf("覆盖 + 过期应释放 2 次，实际 %d 次", released.Load())
+	}
+	if v, _ := last.Load().(string); v != "v2" {
+		t.Fatalf("最后一次释放应是 v2，实际 %q", v)
 	}
 }
 
-func TestLongTTLCrossLayers(t *testing.T) {
-	c := NewWithOptions(Options[string, string]{Tick: time.Millisecond, WheelSize: 4})
+func TestLongTTL(t *testing.T) {
+	c := NewWithOptions(Options[string, string]{Tick: time.Millisecond})
 	defer c.Stop()
 
-	// 远大于当前层一圈（4ms），会跨越多层时间轮
+	// 长 TTL 也应到期释放
 	c.Set("k", "v", time.Second)
 
 	waitFor(t, 3*time.Second, func() bool { return c.Len() == 0 })

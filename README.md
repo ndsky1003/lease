@@ -1,6 +1,6 @@
 # lease
 
-一个基于**时间轮**的高性能资源容器，提供**空闲超时（滑动过期 / 租约）**语义：
+一个基于**分桶**的高性能资源容器，提供**空闲超时（滑动过期 / 租约）**语义：
 
 - 资源添加进来时附带一个存活时长（TTL）；
 - 每次使用（`Get`）会**记录访问时间**；
@@ -12,8 +12,8 @@
 ## 特性
 
 - **租约语义**：`Set` 发租约，`Get` 续租，超时不续自动回收。
-- **无锁读取**：`Get` 只对最后访问时间做一次原子写，零锁、零分配，不移动定时任务。
-- **无全局扫描**：过期检测由分层时间轮驱动，每格只处理一个槽位，O(1)，不存在类似 GC 的全表扫描卡顿。
+- **无锁读取**：`Get` 只对最后访问时间做一次原子写，零锁、零分配，不移动条目。
+- **无全局扫描**：过期检测由单个 ticker 按到期桶批量处理，每个桶 O(1)，不存在类似 GC 的全表扫描卡顿。
 - **访问合并**：可配置 `RenewInterval`，合并高频访问的无谓原子写。
 - **自动释放**：过期时回调 `OnEvict`，或 value 实现了 `io.Closer` 则自动 `Close`。
 - **线程安全**：并发读写经 `-race` 验证。
@@ -46,7 +46,7 @@ func main() {
 Set(key, v, 2天)   →  发租约，2 天后到期
 Get(key)           →  命中并续租，重新计时 2 天
 2 天没 Get          →  到期，OnEvict 自动释放
-再次 Set            →  重新加载并重新计时
+再次 Set            →  释放旧值，重新加载并重新计时
 ```
 
 这是"空闲超时"（idle timeout）语义：资源在**最后一次使用**之后存活 `ttl` 时长，
@@ -54,13 +54,13 @@ Get(key)           →  命中并续租，重新计时 2 天
 
 ## 实现方式
 
-本库把"续租"从时间轮操作中剥离出来：
+本库把"续租"从定时任务中剥离出来：
 
-- `Set` 时挂一个**定时检查任务**（`AfterFunc(ttl, ...)`），到期检查该元素是否仍应存在；
-- `Get` 只**原子更新最后访问时间**，不移动、不重建定时任务；
-- 定时任务到期时，若距最后访问已超过 `ttl`（空闲超时），则**释放资源并停掉该任务**；否则重新调度到剩余时间。
+- `Set` 时把条目按**到期时刻**（`now + ttl`，对齐到 `Tick`）落入对应的到期桶；
+- `Get` 只**原子更新最后访问时间**，不移动、不重建任何定时任务；
+- 单个 ticker 每 `Tick` 批量处理到期的桶：若距最后访问已超过 `ttl`（空闲超时），则**释放资源**；否则按剩余时间**重新分桶**。
 
-这样 `Get` 完全无锁（一次 `atomic.Store`），避免了传统"续期即 Stop+AfterFunc"的高开销。
+这样 `Get` 完全无锁（一次 `atomic.Store`），避免了传统"续期即 Stop+AfterFunc"的高开销，也省去了每个条目一个定时任务的分配成本。
 
 ## API
 
@@ -70,20 +70,20 @@ func New[K comparable, V any](onEvict func(K, V)) *Lease[K, V]
 func NewWithOptions[K comparable, V any](opts Options[K, V]) *Lease[K, V]
 
 // 操作
-func (l *Lease[K, V]) Set(key K, value V, ttl time.Duration) // ttl<=0 表示永不过期
+func (l *Lease[K, V]) Set(key K, value V, ttl time.Duration) // ttl<=0 永不过期；覆盖已有 key 先释放旧值
 func (l *Lease[K, V]) Get(key K) (value V, ok bool)          // 命中并记录访问
 func (l *Lease[K, V]) Has(key K) bool
 func (l *Lease[K, V]) Delete(key K)
 func (l *Lease[K, V]) Len() int
-func (l *Lease[K, V]) Stop() // 停止时间轮并释放所有资源
+func (l *Lease[K, V]) Stop() // 停止到期处理循环并释放所有资源
 ```
 
 ## 配置项
 
 ```go
 type Options[K comparable, V any] struct {
-	Tick          time.Duration // 时间轮每格时长，默认 1 秒
-	WheelSize     int64         // 每层槽位数量，默认 64
+	Tick          time.Duration // 到期桶处理周期，默认 1 秒
+	WheelSize     int64         // 已弃用：分桶实现下不再需要，保留以兼容旧代码
 	OnEvict       func(K, V)    // 释放回调
 	RenewInterval time.Duration // 访问合并阈值，<=0 表示每次 Get 都记录
 }
@@ -127,20 +127,20 @@ func OnAction(id string) *Player {
 
 | 操作 | 机制 | 性能（Apple M1）|
 |------|------|----------------|
-| `Get`（读 + 记录访问） | 读锁 + 原子写 | ~95 ns，0 分配，约 1000 万 QPS |
-| `Set` | 写锁 + 投递时间轮 | ~850 ns |
-| 过期释放 | 定时检查 + 释放 | 约 85 万/s |
+| `Get`（读 + 记录访问） | 读锁 + 原子写 | ~50 ns，0 分配，约 2000 万 QPS |
+| `Set` | 写锁 + 落入到期桶 | ~260 ns |
+| 过期释放 | ticker 批量检查 + 释放 | 约 400 万/s |
 
 - `Get` 的续租是**无锁**的：`lastAccess` 为原子变量，`Get` 里一次 `Store` 即完成。
 - 过期判定与释放均为原子操作 + 指针比较，无数据竞态（`-race` 通过）。
 
-## 原理：分层时间轮
+## 原理：分桶到期
 
-过期检测用**分层时间轮**实现，避免"定时器堆/全表扫描"的全局开销：
+过期检测用**按到期时刻分桶**实现，避免"每个条目一个定时器"的分配开销，也避免"定时器堆/全表扫描"的全局开销：
 
-- 每层由若干槽位组成，一圈覆盖 `tick × wheelSize`，超出范围的定时任务投递到上层（上层 tick 等于当前层一圈），从而指数级扩大时间跨度。
-- 每格只处理当前一个槽位（O(1)），不随条目总数退化。
-- 底层调度使用开源库 [`github.com/RussellLuo/timingwheel`](https://github.com/RussellLuo/timingwheel)（Kafka 分层时间轮的 Go 移植）。
+- 条目按 `now + ttl` 对齐到 `Tick` 后落入对应的到期桶（`map[到期时刻][]*entry`），`Set` 是 O(1)。
+- 单个 ticker 对齐到 `Tick` 边界逐格推进，每个周期只处理当前到期的桶，O(1)，不随条目总数退化。
+- 到期桶稀疏存储，天然支持任意跨度的 TTL，无需时间轮的分层/溢出结构。
 
 ## License
 
