@@ -160,12 +160,12 @@ func (l *Lease[K, V]) Set(key K, value V, ttl time.Duration) {
 func (l *Lease[K, V]) Get(key K) (value V, ok bool) {
 	l.mu.RLock()
 	e, exists := l.items[key]
+	if exists && e.ttl > 0 {
+		e.touch()
+	}
 	l.mu.RUnlock()
 	if !exists {
 		return
-	}
-	if e.ttl > 0 {
-		e.touch()
 	}
 	return e.value, true
 }
