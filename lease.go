@@ -344,8 +344,18 @@ func (l *Lease[K, V]) flush(due int64) {
 
 // expire 是到期回调：空闲未超时则重新落桶，否则从容器移除。
 // 用循环而非递归重试「lastAccess 被并发更新」的情况，避免极端并发下的深递归栈溢出。
+//
+// 若条目仍有调用方持有引用（refs > 1），视为「使用中」，推迟空闲判定（重新落桶），
+// 保持条目可命中——避免「别处 Get 未命中、重新加载」导致数据分裂。等 refs 归零
+// （仅剩容器持有）后才做空闲超时移除。
 func (l *Lease[K, V]) expire(e *entry[K, V]) {
 	for {
+		// 有调用方持有引用，推迟判定，保持条目存活
+		if e.refs.Load() > 1 {
+			l.rebucket(e, time.Now().UnixNano()+int64(e.ttl))
+			return
+		}
+
 		now := time.Now().UnixNano()
 		last := e.lastAccess.Load()
 		if remaining := int64(e.ttl) - (now - last); remaining > 0 {
@@ -357,6 +367,10 @@ func (l *Lease[K, V]) expire(e *entry[K, V]) {
 		if l.items[e.key] != e {
 			l.mu.Unlock()
 			return
+		}
+		if e.refs.Load() > 1 {
+			l.mu.Unlock()
+			continue // 加锁期间有新引用进来，重新推迟
 		}
 		if now-e.lastAccess.Load() >= int64(e.ttl) {
 			delete(l.items, e.key)

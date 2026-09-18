@@ -92,16 +92,17 @@ func TestMustGetRelease(t *testing.T) {
 	}
 
 	time.Sleep(60 * time.Millisecond)
-	if c.Len() != 0 {
-		t.Fatalf("过期后应已移除，Len=%d", c.Len())
+	if c.Len() != 1 {
+		t.Fatalf("持有引用期间条目应保持，Len=%d", c.Len())
 	}
 	if released.Load() != 0 {
 		t.Fatal("持有引用期间不应释放")
 	}
 
 	release()
-	if released.Load() != 1 {
-		t.Fatalf("release 后应释放一次，实际 %d", released.Load())
+	waitFor(t, time.Second, func() bool { return released.Load() == 1 })
+	if c.Len() != 0 {
+		t.Fatalf("release 后条目应被移除，Len=%d", c.Len())
 	}
 }
 

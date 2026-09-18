@@ -22,9 +22,11 @@ go test -bench=. -benchmem -run='^$' -benchtime=2s
 
 - **桶里存 `*entry`，取消用 `cancelled` 标志**：`Set` 覆盖/`Delete` 时 `e.cancelled.Store(true)`，`flush` 里 `if e.cancelled.Load() { continue }` 丢弃。别改回"每条目一个 Task + Cancel"。
 
-- **续期是"无锁"，不移动/不重建定时任务**：`Get` 只做一次 `RLock` 查表 + `e.touch()`（`atomic.Store` 到 `lastAccess`）+ `e.refs.Add(1)`，不碰时间轮。到期回调 `expire` 读 `lastAccess`，空闲未超时就 `rebucket`（再 `put` 剩余时长），否则从 `items` 移除。不要改成"每次 Get 都重排"。
+- **续期是"无锁"，不移动/不重建定时任务**：`Get` 只做一次 `RLock` 查表 + `e.touch()`（`atomic.Store` 到 `lastAccess`）+ `e.refs.Add(1)`，不碰时间轮。到期回调 `expire` 先查 `refs`：`refs > 1`（有调用方持有）就 `rebucket` 推迟、不做空闲判定；`refs == 1` 才读 `lastAccess` 判定空闲——未超时 `rebucket` 剩余时长，超时则从 `items` 移除。不要改成"每次 Get 都重排"。
 
 - **物理释放由引用计数收敛，不是指针判断**：`refs` 初始为 1（`items` 持有），`Get` 命中 +1，`release`/`Delete`/覆盖/`expire` 各 -1，归零时才真正 `release`。`entry.unref()` 用 CAS 循环减一、只在从 1 降到 0 时返回 true（触发物理释放），`refs<=0` 后再调用返回 false（幂等）。「释放恰好一次」靠这个 CAS 协议保证，别改回"指针判断后直接释放"。
+
+- **有引用就不逻辑移除**：`expire` 里 `refs > 1`（除 `items` 外还有调用方持有）时不做空闲判定，直接 `rebucket` 推迟，保持条目可命中；只有 `refs == 1`（仅容器持有）才判定空闲超时移除。这是"持有 = 使用中"语义，避免别处 `Get` 未命中重新加载造成数据分裂。锁外先查一次 `refs` 做快速路径，锁内还要再查一次（锁外读后到加锁前可能有 `Get` 进来），别只靠锁外那一次。
 
 - **`release` 闭包幂等**：`Get` 里用 `int32` + `atomic.CompareAndSwapInt32(&released, 0, 1)` 保证同一个 `release` 闭包多次调用只释放一次引用，防止"误调两次 release 把容器引用也释放掉"导致 use-after-free 回归。这是 `Get` 比纯 `func(){ l.releaseRef(e) }` 多 1 alloc 的原因，别为省分配去掉它。
 

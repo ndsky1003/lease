@@ -206,8 +206,8 @@ func TestStopReleasesAll(t *testing.T) {
 	}
 }
 
-// 引用计数应保证：Get 命中后，即使条目空闲过期被移出容器，value 也只在
-// release 时才真正释放，消除 use-after-free。
+// 引用计数应保证：Get 命中后，即使 ttl 到期，条目也因「有引用」而保持存活（不逻辑移除），
+// value 只在 release 后才可能被移除并释放，消除 use-after-free 与数据分裂。
 func TestRefCountDelaysRelease(t *testing.T) {
 	var released atomic.Int32
 	c := NewWithOptions(Options[string, string]{
@@ -223,18 +223,20 @@ func TestRefCountDelaysRelease(t *testing.T) {
 		t.Fatal("Get 失败")
 	}
 
-	// 等待 ttl 过期：条目已从容器移除，但因持有引用，value 不应被释放
+	// 持有引用期间，即使 ttl 过期，条目也应保持（有引用就不移除），value 不被释放
 	time.Sleep(60 * time.Millisecond)
-	if c.Len() != 0 {
-		t.Fatalf("过期后应已从容器移除，Len=%d", c.Len())
+	if c.Len() != 1 {
+		t.Fatalf("持有引用期间条目应保持，Len=%d", c.Len())
 	}
 	if released.Load() != 0 {
 		t.Fatal("持有引用期间 value 不应被释放")
 	}
 
+	// release 后条目变为空闲，应被移除并释放
 	release()
-	if released.Load() != 1 {
-		t.Fatalf("release 后应释放一次，实际 %d", released.Load())
+	waitFor(t, time.Second, func() bool { return released.Load() == 1 })
+	if c.Len() != 0 {
+		t.Fatalf("release 后条目应被移除，Len=%d", c.Len())
 	}
 }
 
