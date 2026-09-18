@@ -69,9 +69,10 @@ func (e *entry[K, V]) unref() bool {
 
 // Options 用于配置缓存。
 type Options[K comparable, V any] struct {
-	Tick          time.Duration // 时间轮 tick（到期检查粒度），默认 1 秒
-	OnEvict       func(K, V)    // 释放回调；为 nil 时，若 value 实现了 io.Closer 则自动 Close
-	RenewInterval time.Duration // 访问合并阈值：距上次更新不足该值则跳过；<=0 表示每次访问都更新
+	Tick          time.Duration      // 时间轮 tick（到期检查粒度），默认 1 秒
+	OnEvict       func(K, V)         // 释放回调；为 nil 时，若 value 实现了 io.Closer 则自动 Close
+	RenewInterval time.Duration      // 访问合并阈值：距上次更新不足该值则跳过；<=0 表示每次访问都更新
+	Gen           func(K) (V, error) // 加载函数；MustGet 未命中时调用
 }
 
 // Lease 是一个带空闲超时（滑动过期）的资源容器。
@@ -96,6 +97,7 @@ type Lease[K comparable, V any] struct {
 	items map[K]*entry[K, V]
 
 	onEvict       func(K, V)
+	gen           func(K) (V, error)
 	renewInterval time.Duration
 }
 
@@ -115,6 +117,7 @@ func NewWithOptions[K comparable, V any](opts Options[K, V]) *Lease[K, V] {
 		items:         make(map[K]*entry[K, V]),
 		buckets:       make(map[int64][]*entry[K, V]),
 		onEvict:       opts.OnEvict,
+		gen:           opts.Gen,
 		renewInterval: opts.RenewInterval,
 		stopC:         make(chan struct{}),
 	}
@@ -163,12 +166,67 @@ func (l *Lease[K, V]) Get(key K) (value V, release func(), ok bool) {
 	if !exists {
 		return
 	}
+	return e.value, l.newRelease(e), true
+}
+
+// MustGet 读取一个资源；未命中时用 gen 加载并写入容器（cache-aside）。
+// ttl 仅对本次新写入生效；命中的条目沿用其原有 ttl。release 必须配对调用。
+func (l *Lease[K, V]) MustGet(key K, ttl time.Duration) (value V, release func(), err error) {
+	// 快速路径：读锁命中直接返回
+	l.mu.RLock()
+	e, exists := l.items[key]
+	if exists {
+		if e.ttl > 0 {
+			e.touch()
+		}
+		e.refs.Add(1)
+	}
+	l.mu.RUnlock()
+	if exists {
+		return e.value, l.newRelease(e), nil
+	}
+
+	// 慢路径：锁外加载，不持锁做 IO（避免阻塞读写，也避免 gen 回调本容器导致死锁）。
+	// 代价是并发未命中会各自触发 gen（击穿）；若需合并并发加载可再加 singleflight。
+	value, err = l.gen(key)
+	if err != nil {
+		return value, nil, err
+	}
+
+	// 写锁双重检查：加载期间可能已被其他 goroutine 填充
+	l.mu.Lock()
+	if existing, exists := l.items[key]; exists {
+		if existing.ttl > 0 {
+			existing.touch()
+		}
+		existing.refs.Add(1)
+		l.mu.Unlock()
+		l.release(key, value) // 丢弃本次加载结果，释放其持有的资源
+		return existing.value, l.newRelease(existing), nil
+	}
+
+	e = newEntry(key, value, ttl, l.renewInterval)
+	l.items[key] = e
+	if ttl > 0 {
+		now := time.Now().UnixNano()
+		e.lastAccess.Store(now)
+		e.lastRenew.Store(now)
+		l.put(e, l.align(now+int64(ttl)))
+	}
+	e.refs.Add(1)
+	l.mu.Unlock()
+
+	return e.value, l.newRelease(e), nil
+}
+
+// newRelease 构造一个幂等的 release 闭包：同一闭包多次调用只释放一次引用。
+func (l *Lease[K, V]) newRelease(e *entry[K, V]) func() {
 	var released atomic.Int32
-	return e.value, func() {
+	return func() {
 		if released.CompareAndSwap(0, 1) {
 			l.releaseRef(e)
 		}
-	}, true
+	}
 }
 
 // Has 判断 key 是否存在。纯探测：不续期、不增加引用计数。

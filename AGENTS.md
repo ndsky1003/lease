@@ -42,7 +42,9 @@ go test -bench=. -benchmem -run='^$' -benchtime=2s
 
 - **泛型 + 零装箱是刻意设计（热路径）**：`Get`/`Set` 热路径全程具体类型，无 `any` 装箱。唯一的装箱在 `release` 的 `any(value).(io.Closer)`，属释放路径、非热路径，可接受。别在 `Get`/`Set`/`touch`/`expire`/`unref` 引入 `any`。
 
-- **`Options.WheelSize` 已弃用**：时间轮实现不需要它，字段保留仅为 API 兼容，实现里不读取。
+- **`Options.Gen func(K) (V, error)` 是 `MustGet` 的加载函数**：`NewWithOptions` 里赋值到 `l.gen`。`Options` 已无 `WheelSize`（字段已移除）。
+
+- **`MustGet` 是 cache-aside，`gen` 锁外执行**：快速路径 `RLock` 命中即返回；未命中时 `gen` 在锁外调用（不持锁 IO、不死锁），再用 `Lock` 双重检查防重复写入；双重检查命中时丢弃本次 `gen` 结果并 `l.release` 释放。`gen` 锁外意味着并发未命中会各自触发 `gen`（击穿），要合并加载需 singleflight。`release` 闭包统一由 `newRelease` 构造（幂等），`Get`/`MustGet` 共用。
 
 - **分配开销在 `Set`、每次 `rebucket` 与每次 `Get`**：`Set` 分配 `*entry` + 落桶 append（约 2 alloc/op）；`Get` 返回的 `release` 闭包 + 幂等标志（约 2 alloc/op）。这是分桶 + 引用计数的固有代价，别误以为是无谓分配去"优化"掉。
 
