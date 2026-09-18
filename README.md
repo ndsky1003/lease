@@ -102,6 +102,22 @@ type Options[K comparable, V any] struct {
 `RenewInterval` 用于合并高频访问：距上次更新不足该值则跳过续期，避免频繁访问时的无谓原子写。
 代价是 `lastAccess` 会落后真实访问时间最多 `RenewInterval`，空闲超时**提前**判定——条目最多提前 `RenewInterval` 释放（例如 TTL 2 天、阈值 10 分钟，实际存活时间在 1 天 23 小时 50 分钟到 2 天之间）。
 
+### 参数约束
+
+`Tick` / `ttl` / `RenewInterval` 之间的量级关系会直接影响正确性，两条硬约束：
+
+- **`Tick` 必须远小于 `ttl`**：到期时刻被向上取整到 `Tick` 边界，实际存活 ∈ `[ttl, ttl+Tick)`。`ttl < Tick` 时存活被放大；`Tick` 过大则回收严重滞后。建议 `Tick <= ttl/10`。
+- **`RenewInterval` 必须小于 `ttl`**：合并窗口若 `>= ttl`，`Get` 的续期会被一直跳过（`lastAccess` 停在初始值），条目即使频繁访问也会按原 `ttl` 过期，租约失效。建议 `RenewInterval <= ttl/2`。
+
+以下是有意设计、不算错误：`ttl <= 0` 永不过期；`RenewInterval <= 0` 每次 `Get` 都续期；`Tick <= 0` 退化为 1 秒。
+
+| 反例 | 现象 |
+|------|------|
+| `Tick=1s, ttl=5ms` | 条目实际存活 ~1s（量化放大 200 倍） |
+| `RenewInterval=1h, ttl=5min` | 续期失效，频繁 `Get` 也会被回收 |
+| `Tick=1ns` | 时间轮 ticker 高频触发 + 调度延迟追赶，性能灾难 |
+
+
 ## 示例：玩家会话管理
 
 ```go
