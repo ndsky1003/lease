@@ -2,7 +2,7 @@
 
 单包 Go 库 `lease`（module `github.com/ndsky1003/lease`，Go 1.22）：带空闲超时（租约/滑动过期）的泛型资源容器 `Lease[K comparable, V any]`。
 
-**零外部依赖**：`go.mod` 无 require，`go.sum` 为空。全部实现在 `lease.go`，用「按到期时刻分桶 + 单个对齐 ticker」驱动过期，不依赖任何时间轮库。
+**零外部依赖**：`go.mod` 无 require，`go.sum` 为空。全部实现在 `lease.go`，过期检测用内置的单层分桶时间轮（`buckets` + `run` + `flush` + `align`），不依赖任何外部库。
 
 ## 关键命令
 
@@ -16,28 +16,39 @@ go test -bench=. -benchmem -run='^$' -benchtime=2s
 
 ## 架构要点（容易踩坑）
 
-- 全部实现都在 `lease.go`。`entry[K,V]` 是缓存条目，持有 `key/value/ttl`、`renewInterval`、`lastAccess`/`lastRenew` 两个 `atomic.Int64`。**没有** `sync.Mutex` 和定时任务字段（早前时间轮版的 `mu`/`timer` 已随重构移除）。
+- 全部实现都在 `lease.go`。`entry[K,V]` 是缓存条目，持有 `key/value/ttl`、`renewInterval`、`lastAccess`/`lastRenew` 两个 `atomic.Int64`、`refs atomic.Int64`（引用计数）、`cancelled atomic.Bool`（是否被覆盖/删除）。`Lease` 内联了时间轮的字段（`tick`/`startNs`/`lastDue`/`buckets`/`stopC`/`wg`）与方法（`put`/`run`/`flush`/`align`），桶里直接存 `*entry[K,V]`，**没有** `*Task` 或到期闭包（已随内联移除）。
 
-- **过期靠"分桶 + 单 ticker"，不是每条目一个定时任务**：`Set` 时把条目按 `align(now+ttl)` 落到 `buckets map[int64][]*entry`（key 是对齐到 Tick 的到期时刻）。`run()` 用一个对齐到 Tick 边界的 `time.Timer` 逐格推进，每格 flush 当前到期桶。不要在 `Set` 里创建任何 per-entry 定时器。
+- **过期靠内置时间轮（单层分桶 + 对齐 ticker），不是外部库**：`Set` 时 `l.put(e, l.align(now+ttl))` 把条目落入到期桶；`run()` 用对齐到 Tick 边界的 `time.Timer` 逐格推进，每格 `flush` 到期桶。不要重新造 ticker 或 bucket，也不要退回外部时间轮依赖。
 
-- **续期是"无锁"，不移动条目**：`Get` 只做一次 `RLock` 查表 + `e.touch()`（`atomic.Store` 到 `lastAccess`），不碰 bucket。到期桶 flush 时 `expire` 读 `lastAccess`，空闲未超时就 `rebucket` 剩余时长，否则释放。不要改成"到期即重建/移动"。
+- **桶里存 `*entry`，取消用 `cancelled` 标志**：`Set` 覆盖/`Delete` 时 `e.cancelled.Store(true)`，`flush` 里 `if e.cancelled.Load() { continue }` 丢弃。别改回"每条目一个 Task + Cancel"。
 
-- **`align` 是向上取整（ceil），不是 floor**：`(x + tickNs - 1) / tickNs * tickNs`。用 floor 会让到期时刻落在已过去的桶，被推进中的 ticker 永久漏掉（条目永不释放）。改这里要格外小心。
+- **续期是"无锁"，不移动/不重建定时任务**：`Get` 只做一次 `RLock` 查表 + `e.touch()`（`atomic.Store` 到 `lastAccess`）+ `e.refs.Add(1)`，不碰时间轮。到期回调 `expire` 读 `lastAccess`，空闲未超时就 `rebucket`（再 `put` 剩余时长），否则从 `items` 移除。不要改成"每次 Get 都重排"。
 
-- **`run()` 的 for 循环要逐个 flush 中间边界**：`for d := lastDue + tickNs; d <= cur; d += tickNs`。这是防"调度延迟/GC 停顿 > Tick 导致跳过中间到期桶"的兜底。删掉它会在卡顿时漏释放。
+- **物理释放由引用计数收敛，不是指针判断**：`refs` 初始为 1（`items` 持有），`Get` 命中 +1，`release`/`Delete`/覆盖/`expire` 各 -1，归零时才真正 `release`。`entry.unref()` 用 CAS 循环减一、只在从 1 降到 0 时返回 true（触发物理释放），`refs<=0` 后再调用返回 false（幂等）。「释放恰好一次」靠这个 CAS 协议保证，别改回"指针判断后直接释放"。
 
-- **`expire`/`rebucket` 的双重检查依赖指针同一性**：`l.items[e.key] != e` 判断条目是否被并发 `Set`/`Delete` 替换，是防重复释放和僵尸条目的关键。保持 `*entry` 指针比较，别改成 value 比较。
+- **`release` 闭包幂等**：`Get` 里用 `int32` + `atomic.CompareAndSwapInt32(&released, 0, 1)` 保证同一个 `release` 闭包多次调用只释放一次引用，防止"误调两次 release 把容器引用也释放掉"导致 use-after-free 回归。这是 `Get` 比纯 `func(){ l.releaseRef(e) }` 多 1 alloc 的原因，别为省分配去掉它。
 
-- **`ttl <= 0` 表示永不过期**：`Set` 时不落桶。`Delete` 直接删 `items` 并释放，桶里的旧条目留到 flush 时被指针判断丢弃。
+- **`expire`/`rebucket` 的双重检查依赖指针同一性**：`l.items[e.key] != e` 判断条目是否被并发 `Set`/`Delete` 替换，是决定"是否从 `items` 逻辑移除"的关键，防止重复移除和僵尸条目。保持 `*entry` 指针比较，别改成 value 比较。
 
-- **`Set` 覆盖已有 key 会释放旧值**：替换发生在锁内，旧值 `release` 在锁外调用（避免持锁调用户回调）。释放旧值 + `items[key] != e` 指针判断配合，保证并发 `Set`/`expire`/`Delete` 下每个 value 恰好释放一次，不会重复或遗漏。别把旧值的释放移进锁内，也别删掉指针判断。
+- **`refs` 增减的时序不变量**：`Get` 的 `refs.Add(1)` 在 `RLock` 内、且只对 `items[key]` 当前指向的 entry 执行；`releaseRef`（触发 `unref`）一定发生在该 entry 已被 `delete`/替换出 `items` **之后**。二者经 `RWMutex` 互斥 + "先移除再释放"的顺序保证，绝不会出现"释放后又 Add(1)"的 use-after-free。别把 `releaseRef` 移到删除 `items` 之前。
 
-- **泛型 + 零装箱是刻意设计（热路径）**：`Get`/`Set` 热路径全程具体类型，无 `any` 装箱。唯一的装箱在 `release` 的 `any(value).(io.Closer)`，属释放路径、非热路径，可接受。别在 `Get`/`Set`/`touch`/`expire` 引入 `any`。
+- **锁顺序固定为 `l.mu -> l.wheelMu`**：`put` 内部加 `wheelMu`（`Set`/`rebucket` 持 `l.mu` 调 `put`）；时间轮回调（`flush` 在 `wheelMu` 锁外执行 `expire`）里才加 `l.mu`，两者无反向持有，不构成死锁。不要在 `l.mu` 之外反向嵌套。
 
-- **`Options.WheelSize` 已弃用**：分桶实现不需要它，字段保留仅为 API 兼容，实现里不读取。
+- **`ttl <= 0` 表示永不过期**：`Set` 时不落桶。`Delete` 直接删 `items`、`cancelled.Store(true)` 并 `releaseRef`；残留的到期回调触发时被 `cancelled`/指针判断丢弃。
+
+- **`Set` 覆盖已有 key 会移除旧值**：替换发生在锁内（含 `cancelled.Store(true)`），旧值 `releaseRef` 在锁外调用（释放引用，避免持锁调用户回调）。若旧值仍被调用方持有，会延迟到最后一个 `release`。
+
+- **`Has` 是纯探测**：直接 `RLock` 查表，不 `touch`、不 `refs.Add`。别让 `Has` 走 `Get`（否则会顺带续期 + 加引用，语义被污染）。
+
+- **泛型 + 零装箱是刻意设计（热路径）**：`Get`/`Set` 热路径全程具体类型，无 `any` 装箱。唯一的装箱在 `release` 的 `any(value).(io.Closer)`，属释放路径、非热路径，可接受。别在 `Get`/`Set`/`touch`/`expire`/`unref` 引入 `any`。
+
+- **`Options.WheelSize` 已弃用**：时间轮实现不需要它，字段保留仅为 API 兼容，实现里不读取。
+
+- **分配开销在 `Set`、每次 `rebucket` 与每次 `Get`**：`Set` 分配 `*entry` + 落桶 append（约 2 alloc/op）；`Get` 返回的 `release` 闭包 + 幂等标志（约 2 alloc/op）。这是分桶 + 引用计数的固有代价，别误以为是无谓分配去"优化"掉。
 
 ## 测试注意事项
 
 - 测试依赖真实时间（毫秒级 `Tick` + `sleep`/`waitFor` 轮询），时间敏感，偶发因调度抖动变慢或失败；失败先重跑，别急着改逻辑。
 - `concurrent_test.go` 是并发压力测试，必须配合 `-race` 才有意义。
-- 性能数字在 `README.md` 和 `bench_test.go`；改动 `touch`/`expire`/`rebucket`/`Set`/`run` 等热路径后重跑 `BenchmarkGet`/`BenchmarkSet` 确认无回退。
+- `TestRefCountDelaysRelease`/`TestRefCountOverwriteDelaysRelease`/`TestReleaseIdempotent`/`TestConcurrentGetRefCount` 验证引用计数语义（延迟释放、幂等），改 `refs`/`unref`/`releaseRef`/`Get` 后必须跑。
+- 性能数字在 `README.md` 和 `bench_test.go`；改动 `touch`/`expire`/`rebucket`/`Set`/`Get`/`unref`/`put`/`flush` 等热路径后重跑 `BenchmarkGet`/`BenchmarkSet` 确认无回退。

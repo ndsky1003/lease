@@ -39,7 +39,9 @@ func TestConcurrentAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < ops; i++ {
-				c.Get(i % keyRange)
+				if _, release, ok := c.Get(i % keyRange); ok {
+					release()
+				}
 			}
 		}()
 	}
@@ -71,10 +73,12 @@ func TestConcurrentRenew(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 2000; i++ {
-				if _, ok := c.Get("hot"); !ok {
+				_, release, ok := c.Get("hot")
+				if !ok {
 					t.Error("并发续期期间资源被释放")
 					return
 				}
+				release()
 			}
 		}()
 	}

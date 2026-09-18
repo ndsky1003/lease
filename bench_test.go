@@ -25,7 +25,9 @@ func BenchmarkGet(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.Get(i % 100000)
+		if _, release, ok := c.Get(i % 100000); ok {
+			release()
+		}
 	}
 }
 

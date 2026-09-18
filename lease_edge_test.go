@@ -24,7 +24,7 @@ func TestGetMissing(t *testing.T) {
 	c := NewWithOptions(Options[string, int]{Tick: 5 * time.Millisecond})
 	defer c.Stop()
 
-	v, ok := c.Get("none")
+	v, _, ok := c.Get("none")
 	if ok {
 		t.Fatal("不存在的 key 应返回 ok=false")
 	}
@@ -57,8 +57,10 @@ func TestDeleteThenReset(t *testing.T) {
 	c.Delete("k")
 	c.Set("k", "v2", time.Minute)
 
-	if v, ok := c.Get("k"); !ok || v != "v2" {
+	if v, release, ok := c.Get("k"); !ok || v != "v2" {
 		t.Fatalf("Delete 后重新 Set 应生效，v=%v ok=%v", v, ok)
+	} else {
+		release()
 	}
 }
 
@@ -73,8 +75,10 @@ func TestSetOverwriteChangesTTL(t *testing.T) {
 	if c.Len() != 1 {
 		t.Fatalf("覆盖后应按新 ttl 存活，Len=%d", c.Len())
 	}
-	if v, ok := c.Get("k"); !ok || v != "v2" {
+	if v, release, ok := c.Get("k"); !ok || v != "v2" {
 		t.Fatalf("覆盖后应返回新值，v=%v ok=%v", v, ok)
+	} else {
+		release()
 	}
 }
 
@@ -116,8 +120,10 @@ func TestOverwriteToNoExpire(t *testing.T) {
 	if c.Len() != 1 {
 		t.Fatalf("永不过期条目应保留，Len=%d", c.Len())
 	}
-	if v, ok := c.Get("k"); !ok || v != "v2" {
+	if v, release, ok := c.Get("k"); !ok || v != "v2" {
 		t.Fatalf("应返回新值 v2，v=%v ok=%v", v, ok)
+	} else {
+		release()
 	}
 }
 
@@ -242,7 +248,13 @@ func TestOverwriteReleasesEachValue(t *testing.T) {
 	c.Set("k", "v2", 20*time.Millisecond) // 覆盖释放 v1
 	c.Set("k", "v3", 20*time.Millisecond) // 覆盖释放 v2
 
-	waitFor(t, 2*time.Second, func() bool { return c.Len() == 0 })
+	// 等待全部三个值释放完成（释放时机与容器长度非原子一致，须以 released 为准）
+	waitFor(t, 2*time.Second, func() bool {
+		mu.Lock()
+		n := len(released)
+		mu.Unlock()
+		return n == 3
+	})
 
 	mu.Lock()
 	defer mu.Unlock()

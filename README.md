@@ -1,10 +1,10 @@
 # lease
 
-一个基于**分桶**的高性能资源容器，提供**空闲超时（滑动过期 / 租约）**语义：
+一个基于**内置时间轮**的高性能资源容器，提供**空闲超时（滑动过期 / 租约）**语义：
 
 - 资源添加进来时附带一个存活时长（TTL）；
-- 每次使用（`Get`）会**记录访问时间**；
-- 超过存活时长未被使用，就**自动释放**该资源。
+- 每次使用（`Get`）会**记录访问时间**并**增加引用计数**；
+- 超过存活时长未被使用，就从容器中移除；value 的物理释放在**最后一个引用释放后**才发生。
 
 > `lease`（租约）：`Set` 发租约，`Get` 续租，超时不续自动回收。
 > 它面向的是"带空闲超时的资源容器"，而非传统意义上的缓存（无容量上限、无 LRU、不保证可重建）。
@@ -12,10 +12,11 @@
 ## 特性
 
 - **租约语义**：`Set` 发租约，`Get` 续租，超时不续自动回收。
-- **无锁读取**：`Get` 只对最后访问时间做一次原子写，零锁、零分配，不移动条目。
-- **无全局扫描**：过期检测由单个 ticker 按到期桶批量处理，每个桶 O(1)，不存在类似 GC 的全表扫描卡顿。
+- **引用计数防 use-after-free**：`Get` 命中后持有引用，`release` 之前 value 一定不会被释放（即使期间 ttl 到期、被覆盖或删除）。
+- **轻量读取**：`Get` 只做读锁 + 一次原子写 + 引用计数加一，不移动、不重建定时任务。
+- **无全局扫描**：过期检测委托给时间轮按到期时刻批量处理，排期 O(1)，不存在类似 GC 的全表扫描卡顿。
 - **访问合并**：可配置 `RenewInterval`，合并高频访问的无谓原子写。
-- **自动释放**：过期时回调 `OnEvict`，或 value 实现了 `io.Closer` 则自动 `Close`。
+- **自动释放**：释放时回调 `OnEvict`，或 value 实现了 `io.Closer` 则自动 `Close`。
 - **线程安全**：并发读写经 `-race` 验证。
 - **泛型**：`Lease[K comparable, V any]`，零装箱。
 
@@ -32,11 +33,14 @@ func main() {
 
 	l.Set("conn:1", conn, 5*time.Minute) // 空闲存活 5 分钟
 
-	v, ok := l.Get("conn:1") // 命中并记录访问（续租 5 分钟）
+	v, release, ok := l.Get("conn:1") // 命中并记录访问（续租 5 分钟）+ 加引用
+	if ok {
+		defer release() // 用完释放引用；release 之前 v 不会被释放
+		use(v)
+	}
 
-	l.Delete("conn:1") // 主动释放
-
-	l.Stop() // 停止并释放所有资源
+	l.Delete("conn:1") // 主动删除（无引用时立即释放，有引用时延迟到最后一个 release）
+	l.Stop()           // 停止并释放所有资源
 }
 ```
 
@@ -44,9 +48,10 @@ func main() {
 
 ```
 Set(key, v, 2天)   →  发租约，2 天后到期
-Get(key)           →  命中并续租，重新计时 2 天
-2 天没 Get          →  到期，OnEvict 自动释放
-再次 Set            →  释放旧值，重新加载并重新计时
+Get(key)           →  命中并续租，重新计时 2 天，同时加引用
+release()          →  用完释放引用
+2 天没 Get          →  到期，从容器移除，无引用时 OnEvict 释放
+再次 Set            →  释放旧值（无引用时立即），重新加载并重新计时
 ```
 
 这是"空闲超时"（idle timeout）语义：资源在**最后一次使用**之后存活 `ttl` 时长，
@@ -56,11 +61,13 @@ Get(key)           →  命中并续租，重新计时 2 天
 
 本库把"续租"从定时任务中剥离出来：
 
-- `Set` 时把条目按**到期时刻**（`now + ttl`，对齐到 `Tick`）落入对应的到期桶；
-- `Get` 只**原子更新最后访问时间**，不移动、不重建任何定时任务；
-- 单个 ticker 每 `Tick` 批量处理到期的桶：若距最后访问已超过 `ttl`（空闲超时），则**释放资源**；否则按剩余时间**重新分桶**。
+- `Set` 时把条目按到期时刻落入内置时间轮的到期桶；
+- `Get` 只**原子更新最后访问时间**并**增加引用计数**，不移动、不重建任何定时任务；
+- 到期桶被单个对齐 ticker 批量处理：若距最后访问已超过 `ttl`（空闲超时），则**从容器移除**；否则按剩余时间**重新落桶**。
 
-这样 `Get` 完全无锁（一次 `atomic.Store`），避免了传统"续期即 Stop+AfterFunc"的高开销，也省去了每个条目一个定时任务的分配成本。
+value 的物理释放由**引用计数**统一收敛：条目初始引用数为 1（`items` 持有），`Get` 命中 +1，
+`release`/删除/覆盖/过期 -1，归零时才真正执行 `OnEvict`/`Close`。因此 `Get` 返回的 value 在
+`release` 之前始终有效，消除了 use-after-free。到期时刻的量化、分桶、逐格 flush 全部由内置时间轮处理。
 
 ## API
 
@@ -71,19 +78,19 @@ func NewWithOptions[K comparable, V any](opts Options[K, V]) *Lease[K, V]
 
 // 操作
 func (l *Lease[K, V]) Set(key K, value V, ttl time.Duration) // ttl<=0 永不过期；覆盖已有 key 先释放旧值
-func (l *Lease[K, V]) Get(key K) (value V, ok bool)          // 命中并记录访问
-func (l *Lease[K, V]) Has(key K) bool
+func (l *Lease[K, V]) Get(key K) (value V, release func(), ok bool) // 命中并记录访问 + 加引用；release 必须配对调用
+func (l *Lease[K, V]) Has(key K) bool                        // 纯探测：不续期、不加引用
 func (l *Lease[K, V]) Delete(key K)
 func (l *Lease[K, V]) Len() int
-func (l *Lease[K, V]) Stop() // 停止到期处理循环并释放所有资源
+func (l *Lease[K, V]) Stop() // 停止时间轮并释放所有资源
 ```
 
 ## 配置项
 
 ```go
 type Options[K comparable, V any] struct {
-	Tick          time.Duration // 到期桶处理周期，默认 1 秒
-	WheelSize     int64         // 已弃用：分桶实现下不再需要，保留以兼容旧代码
+	Tick          time.Duration // 时间轮 tick（到期检查粒度），默认 1 秒
+	WheelSize     int64         // 已弃用：时间轮实现下不再需要，保留以兼容旧代码
 	OnEvict       func(K, V)    // 释放回调
 	RenewInterval time.Duration // 访问合并阈值，<=0 表示每次 Get 都记录
 }
@@ -109,57 +116,110 @@ var players = lease.New(func(id string, p *Player) {
 	p.Release() // 2 天没操作，自动释放
 })
 
+var loadMu sync.Mutex // 加载互斥；高并发下可换 singleflight 或分片锁
+
 func OnLogin(id string, p *Player) {
 	players.Set(id, p, 48*time.Hour)
 }
 
-func OnAction(id string) *Player {
-	p, ok := players.Get(id) // 命中则自动续租 2 天
-	if !ok {
-		p = loadFromDB(id) // 已过期释放，重新加载
-		players.Set(id, p, 48*time.Hour)
+// OnAction 把「引用所有权」随 p 一起返回：调用方必须 defer release()。
+// 不要只返回 p 而把 release 吞掉（那会让 p 失去保护，use-after-free 又回来）。
+func OnAction(id string) (*Player, func()) {
+	p, release, ok := players.Get(id) // 命中则自动续租 2 天 + 加引用
+	if ok {
+		return p, release // 引用所有权交给调用方
 	}
-	return p
+
+	loadMu.Lock()
+	defer loadMu.Unlock()
+
+	// 双重检查：其他 goroutine 可能已加载，避免缓存击穿（重复 loadFromDB）
+	if p, release, ok := players.Get(id); ok {
+		return p, release
+	}
+
+	p = loadFromDB(id)
+	players.Set(id, p, 48*time.Hour)
+
+	// 加载后加一次引用，把所有权交给调用方
+	_, release, _ = players.Get(id)
+	return p, release
 }
+
+// 调用方：
+p, release := OnAction(id)
+defer release() // 用完释放；release 幂等
+use(p)
 ```
 
 ## 并发模型与性能
 
 | 操作 | 机制 | 性能（Apple M1）|
 |------|------|----------------|
-| `Get`（读 + 记录访问） | 读锁 + 原子写 | ~50 ns，0 分配，约 2000 万 QPS |
-| `Set` | 写锁 + 落入到期桶 | ~260 ns |
-| 过期释放 | ticker 批量检查 + 释放 | 约 400 万/s |
+| `Get`（读 + 记录访问 + 加引用） | 读锁 + 原子写 + 引用计数 | ~92 ns，2 分配（release 闭包 + 幂等标志），约 1100 万 QPS |
+| `Set` | 写锁 + 落入到期桶 | ~345 ns，2 分配，约 290 万 QPS |
+| 过期释放 | 时间轮批量回调 + 释放 | 约 390 万/s |
 
-- `Get` 的续租是**无锁**的：`lastAccess` 为原子变量，`Get` 里一次 `Store` 即完成。
-- 过期判定与释放均为原子操作 + 指针比较，无数据竞态（`-race` 通过）。
+- `Get` 的续租是原子写（`lastAccess` 为原子变量），引用计数为 `atomic.Int64`，无数据竞态（`-race` 通过）。
+- `Set` 的 2 次分配来自 `*entry` + 落桶 append，是分桶时间轮的固有代价。
+- 释放由引用计数统一收敛，每个 value 恰好释放一次，不重复、不遗漏。
 
-## 注意事项：TOCTOU
+## 注意事项
 
-`Get` 返回的 value 可能在返回之后立刻被并发的 `expire` 释放。这是此类租约容器的通病
-（检查与使用之间存在时间差），`Get` 本身只保证"此刻还在、已续租"，无法保证调用者使用该 value 期间它始终存活。
-调用者需自行判断资源有效性（例如自带的 `Close`/探活机制），或在业务层加引用计数等方式兜底。
+### 引用计数与 release
 
-具体到本实现，存在两个已知的临界窗口：
+`Get` 命中的每个引用都必须**配对调用一次 `release`**（通常 `defer release()`），否则 value 会因引用不归零而泄漏。同一个 `release` 闭包幂等（多次调用只生效一次），但每次 `Get` 返回的 `release` 各自独立，仍需各自调用。
 
-- **`Get` 与 `touch` 之间的缝隙**：`Get` 在 `RLock` 内查到条目、`RUnlock` 之后才执行 `touch`
-  （原子更新 `lastAccess`）。并发的 `expire` 可能恰好在这段缝隙内完成释放，导致 `Get` 返回一个
-  已释放的 value（use-after-free）。`expire` 虽持写锁做了双重检查，但第二次读 `lastAccess` 仍可能
-  读到 `touch` 之前的旧值。
-- **`RenewInterval > 0` 时 `touch` 可能跳过续租**：访问合并会让 `touch` 因距上次更新不足阈值而
-  **故意不更新** `lastAccess`，此时即使 `Get` 命中也不会续租，value 仍可能被立即释放。这是合并语义
-  的固有偏差，与上方「配置项」一节对 `RenewInterval` 的说明一致。
+在 `release` 之前，value 不会被释放——即使它已因 ttl 到期、被 `Delete`、被 `Set` 覆盖而从容器移除，也会延迟到最后一个引用释放。`release` 之后不要再使用该 value。
 
-上述窗口不通过把 `touch` 移进锁来修复——那会破坏「无锁续租」的热路径、拉长读锁持有时间。
-它们属于本库 API 的固有语义边界，需由调用者自行兜底。
+#### 引用所有权的传递
 
-## 原理：分桶到期
+`value` 与 `release` 是绑定的一对。若一个中间函数要把 `value` 返回给上层，必须**把 `release` 一起返回**，绝不能 `defer release()` 后只返回 `value`——那会让调用方拿到已失去保护的 value，use-after-free 又回来了：
 
-过期检测用**按到期时刻分桶**实现，避免"每个条目一个定时器"的分配开销，也避免"定时器堆/全表扫描"的全局开销：
+```go
+// ❌ 错误：defer 在 return 后执行，返回的 v 已无引用保护
+func get() *Conn {
+	v, release, _ := l.Get("k")
+	defer release()
+	return v
+}
 
-- 条目按 `now + ttl` 对齐到 `Tick` 后落入对应的到期桶（`map[到期时刻][]*entry`），`Set` 是 O(1)。
-- 单个 ticker 对齐到 `Tick` 边界逐格推进，每个周期只处理当前到期的桶，O(1)，不随条目总数退化。
-- 到期桶稀疏存储，天然支持任意跨度的 TTL，无需时间轮的分层/溢出结构。
+// ✅ 正确：把 release 随 value 一起交给调用方
+func get() (*Conn, func()) {
+	v, release, ok := l.Get("k")
+	if !ok {
+		return nil, nil
+	}
+	return v, release
+}
+```
+
+如果只是「取出来用一下」，用回调把使用逻辑包进作用域更安全——引用不逃逸，无需手动传递：
+
+```go
+func withConn(key string, fn func(*Conn)) bool {
+	v, release, ok := l.Get(key)
+	if !ok {
+		return false
+	}
+	defer release()
+	fn(v)
+	return true
+}
+```
+
+### 访问合并（RenewInterval）
+
+`RenewInterval > 0` 时 `touch` 可能因距上次更新不足阈值而**故意不续租**，导致空闲超时提前判定的偏差（见「配置项」）。这不再造成 use-after-free（引用计数兜底），但会影响"何时到期"的精度。
+
+## 原理：时间轮到期
+
+过期检测用 **内置单层分桶时间轮**实现，避免"每个条目一个独立定时器"的分配与调度开销，也避免"定时器堆/全表扫描"的全局开销：
+
+- `Set` 时把条目按到期时刻（`now + ttl`，对齐到 `Tick`）落入到期桶（`map[到期时刻][]*entry`），排期 O(1)。
+- 单个对齐 ticker 每 `Tick` 批量 flush 到期桶，逐桶 O(1)，不随条目总数退化。
+- 到期桶稀疏存储，天然支持任意跨度的 TTL。到期时刻被量化到 `Tick` 边界，误差最大一个 `Tick`。
+- 到期回调里做空闲判定：空闲超时则从容器移除，否则按剩余时长重新落桶。
 
 ## License
 
