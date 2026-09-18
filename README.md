@@ -96,8 +96,8 @@ type Options[K comparable, V any] struct {
 }
 ```
 
-`RenewInterval` 用于合并高频访问：距上次更新不足该值则跳过，避免频繁访问时的无谓原子写。
-代价是空闲超时最多产生该值的偏差（例如 TTL 2 天、阈值 10 分钟，实际释放时间在 2 天到 2 天 10 分钟之间）。
+`RenewInterval` 用于合并高频访问：距上次更新不足该值则跳过续期，避免频繁访问时的无谓原子写。
+代价是 `lastAccess` 会落后真实访问时间最多 `RenewInterval`，空闲超时**提前**判定——条目最多提前 `RenewInterval` 释放（例如 TTL 2 天、阈值 10 分钟，实际存活时间在 1 天 23 小时 50 分钟到 2 天之间）。
 
 ## 示例：玩家会话管理
 
@@ -210,7 +210,7 @@ func withConn(key string, fn func(*Conn)) bool {
 
 ### 访问合并（RenewInterval）
 
-`RenewInterval > 0` 时 `touch` 可能因距上次更新不足阈值而**故意不续租**，导致空闲超时提前判定的偏差（见「配置项」）。这不再造成 use-after-free（引用计数兜底），但会影响"何时到期"的精度。
+`RenewInterval > 0` 时 `touch` 可能因距上次更新不足阈值而**故意不续租**，导致 `lastAccess` 落后、空闲超时**提前**判定，条目最多提前 `RenewInterval` 释放（见「配置项」）。这不再造成 use-after-free（引用计数兜底），但生命周期边界会比无节流时更宽（不确定范围 = `[ttl - RenewInterval, ttl]`，外加一个 `Tick` 的量化误差）。
 
 ## 原理：时间轮到期
 
