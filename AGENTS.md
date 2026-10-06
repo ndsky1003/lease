@@ -44,9 +44,11 @@ go test -bench=. -benchmem -run='^$' -benchtime=2s
 
 - **泛型 + 零装箱是刻意设计（热路径）**：`Get`/`Set` 热路径全程具体类型，无 `any` 装箱。唯一的装箱在 `release` 的 `any(value).(io.Closer)`，属释放路径、非热路径，可接受。别在 `Get`/`Set`/`touch`/`expire`/`unref` 引入 `any`。
 
-- **`Options.Gen func(K) (V, error)` 是 `MustGet` 的加载函数**：`NewWithOptions` 里赋值到 `l.gen`。`Options` 已无 `WheelSize`（字段已移除）。
+- **`Options.Gen func(K) (V, error)` 是 `MustGet` 的加载函数**：`NewWithOptions` 里赋值到 `l.gen`。`Options` 已无 `WheelSize`（字段已移除）。`MustGetWithGen` 则不依赖 `l.gen`，而是接受本次调用传入的 `gen`；`MustGet` 本质是 `MustGetWithGen(key, ttl, l.gen)` 的转发。
 
-- **`MustGet` 是 cache-aside，`gen` 锁外执行**：快速路径 `RLock` 命中即返回；未命中时 `gen` 在锁外调用（不持锁 IO、不死锁），再用 `Lock` 双重检查防重复写入；双重检查命中时丢弃本次 `gen` 结果并 `l.release` 释放。`gen` 锁外意味着并发未命中会各自触发 `gen`（击穿），要合并加载需 singleflight。`release` 闭包统一由 `newRelease` 构造（幂等），`Get`/`MustGet` 共用。
+- **`MustGet`/`MustGetWithGen` 是 cache-aside，`gen` 锁外执行**：快速路径 `RLock` 命中即返回；未命中时 `gen` 在锁外调用（不持锁 IO、不死锁），再用 `Lock` 双重检查防重复写入；双重检查命中时丢弃本次 `gen` 结果，走 `releaseValue` 仅释放资源（`Close`）、**不触发 `OnEvict`**（key 仍在容器，避免误报驱逐）。`gen` 锁外意味着并发未命中会各自触发 `gen`（击穿），要合并加载需 singleflight。`release` 闭包统一由 `newRelease` 构造（幂等），`Get`/`MustGet`/`MustGetWithGen` 共用。`gen` 返回 err 时返回零值 value + err（gen 须自行清理半成品）；`gen` 为 nil（未配置 `Options.Gen` 或 `MustGetWithGen` 传 nil）时未命中返回 `ErrGenNil`，不 panic、不写入容器。
+
+- **`OnEvict` 只用于真实驱逐，`releaseValue` 只释放资源**：`release`（被 `releaseRef` 触发）先走 `OnEvict` 回调、否则 `releaseValue`；`releaseValue` 只对 `io.Closer` 做 `Close`，不回调 `OnEvict`。别把「丢弃并发加载结果」和「真实驱逐」混用同一个回调。
 
 - **分配开销在 `Set`、每次 `rebucket` 与每次 `Get`**：`Set` 分配 `*entry` + 落桶 append（约 2 alloc/op）；`Get` 返回的 `release` 闭包 + 幂等标志（约 2 alloc/op）。这是分桶 + 引用计数的固有代价，别误以为是无谓分配去"优化"掉。
 

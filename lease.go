@@ -1,6 +1,7 @@
 package lease
 
 import (
+	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -70,10 +71,14 @@ func (e *entry[K, V]) unref() bool {
 // Options 用于配置缓存。
 type Options[K comparable, V any] struct {
 	Tick          time.Duration      // 时间轮 tick（到期检查粒度），默认 1 秒
-	OnEvict       func(K, V)         // 释放回调；为 nil 时，若 value 实现了 io.Closer 则自动 Close
+	OnEvict       func(K, V)         // 真实驱逐（到期/删除/覆盖/Stop）的释放回调；为 nil 时若 value 实现了 io.Closer 则自动 Close
 	RenewInterval time.Duration      // 访问合并阈值：距上次更新不足该值则跳过；<=0 表示每次访问都更新
-	Gen           func(K) (V, error) // 加载函数；MustGet 未命中时调用
+	Gen           func(K) (V, error) // 加载函数；MustGet 未命中时调用。失败须自行清理半成品并返回零值 + err
 }
+
+// ErrGenNil 表示加载函数缺失：MustGet 未命中需要加载，但 Options.Gen 未设置，
+// 或 MustGetWithGen 传入的 gen 为 nil。此时不会写入容器，value 为零值、release 为 nil。
+var ErrGenNil = errors.New("lease: gen func is nil")
 
 // Lease 是一个带空闲超时（滑动过期）的资源容器。
 //
@@ -169,9 +174,13 @@ func (l *Lease[K, V]) Get(key K) (value V, release func(), ok bool) {
 	return e.value, l.newRelease(e), true
 }
 
-// MustGet 读取一个资源；未命中时用 gen 加载并写入容器（cache-aside）。
+// MustGetWithGen 读取一个资源；未命中时用传入的 gen 加载并写入容器（cache-aside）。
 // ttl 仅对本次新写入生效；命中的条目沿用其原有 ttl。release 必须配对调用。
-func (l *Lease[K, V]) MustGet(key K, ttl time.Duration) (value V, release func(), err error) {
+//
+// gen 是本次调用指定的加载函数；若为 nil，未命中时返回 ErrGenNil（不会写入容器）。
+// gen 返回 err 时返回零值 value + err（gen 须自行清理半成品），且不写入容器。
+// 适合需要按调用指定加载逻辑的场景；若加载逻辑全局唯一，用 Options.Gen + MustGet 即可。
+func (l *Lease[K, V]) MustGetWithGen(key K, ttl time.Duration, gen func(K) (V, error)) (value V, release func(), err error) {
 	// 快速路径：读锁命中直接返回
 	l.mu.RLock()
 	e, exists := l.items[key]
@@ -188,9 +197,13 @@ func (l *Lease[K, V]) MustGet(key K, ttl time.Duration) (value V, release func()
 
 	// 慢路径：锁外加载，不持锁做 IO（避免阻塞读写，也避免 gen 回调本容器导致死锁）。
 	// 代价是并发未命中会各自触发 gen（击穿）；若需合并并发加载可再加 singleflight。
-	value, err = l.gen(key)
+	if gen == nil {
+		return value, nil, ErrGenNil
+	}
+	value, err = gen(key)
 	if err != nil {
-		return value, nil, err
+		var zero V
+		return zero, nil, err
 	}
 
 	// 写锁双重检查：加载期间可能已被其他 goroutine 填充
@@ -201,7 +214,7 @@ func (l *Lease[K, V]) MustGet(key K, ttl time.Duration) (value V, release func()
 		}
 		existing.refs.Add(1)
 		l.mu.Unlock()
-		l.release(key, value) // 丢弃本次加载结果，释放其持有的资源
+		releaseValue(value) // 丢弃本次加载结果：仅释放资源，不触发 OnEvict（key 仍在容器中）
 		return existing.value, l.newRelease(existing), nil
 	}
 
@@ -217,6 +230,14 @@ func (l *Lease[K, V]) MustGet(key K, ttl time.Duration) (value V, release func()
 	l.mu.Unlock()
 
 	return e.value, l.newRelease(e), nil
+}
+
+// MustGet 读取一个资源；未命中时用 Options.Gen 加载并写入容器（cache-aside）。
+// ttl 仅对本次新写入生效；命中的条目沿用其原有 ttl。release 必须配对调用。
+//
+// 若未设置 Options.Gen，未命中时返回 ErrGenNil（不会写入容器）。
+func (l *Lease[K, V]) MustGet(key K, ttl time.Duration) (value V, release func(), err error) {
+	return l.MustGetWithGen(key, ttl, l.gen)
 }
 
 // newRelease 构造一个幂等的 release 闭包：同一闭包多次调用只释放一次引用。
@@ -404,13 +425,20 @@ func (l *Lease[K, V]) releaseRef(e *entry[K, V]) {
 	}
 }
 
-// release 执行资源的释放逻辑。
+// releaseValue 释放 value 持有的资源：仅当 value 实现 io.Closer 时 Close。
+// 不触发 OnEvict，用于释放「从未进入容器的加载结果」（如并发加载被双重检查丢弃），
+// 避免误报「key 被驱逐」。
+func releaseValue[V any](value V) {
+	if closer, ok := any(value).(io.Closer); ok {
+		_ = closer.Close()
+	}
+}
+
+// release 执行真实驱逐的资源释放逻辑：先走 OnEvict 回调（若有），否则自动 Close。
 func (l *Lease[K, V]) release(key K, value V) {
 	if l.onEvict != nil {
 		l.onEvict(key, value)
 		return
 	}
-	if closer, ok := any(value).(io.Closer); ok {
-		_ = closer.Close()
-	}
+	releaseValue(value)
 }

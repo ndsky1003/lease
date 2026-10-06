@@ -82,6 +82,7 @@ func NewWithOptions[K comparable, V any](opts Options[K, V]) *Lease[K, V]
 func (l *Lease[K, V]) Set(key K, value V, ttl time.Duration) // ttl<=0 永不过期；覆盖已有 key 先释放旧值
 func (l *Lease[K, V]) Get(key K) (value V, release func(), ok bool) // 命中并记录访问 + 加引用；release 必须配对调用
 func (l *Lease[K, V]) MustGet(key K, ttl time.Duration) (value V, release func(), err error) // 未命中时用 Gen 加载并写入（cache-aside）
+func (l *Lease[K, V]) MustGetWithGen(key K, ttl time.Duration, gen func(K) (V, error)) (value V, release func(), err error) // 未命中时用传入的 gen 加载；gen 为 nil 时返回 ErrGenNil
 func (l *Lease[K, V]) Has(key K) bool                        // 纯探测：不续期、不加引用
 func (l *Lease[K, V]) Delete(key K)
 func (l *Lease[K, V]) Len() int
@@ -93,9 +94,9 @@ func (l *Lease[K, V]) Stop() // 停止时间轮并释放所有资源
 ```go
 type Options[K comparable, V any] struct {
 	Tick          time.Duration     // 时间轮 tick（到期检查粒度），默认 1 秒
-	OnEvict       func(K, V)        // 释放回调
+	OnEvict       func(K, V)        // 真实驱逐（到期/删除/覆盖/Stop）的释放回调
 	RenewInterval time.Duration     // 访问合并阈值，<=0 表示每次 Get 都记录
-	Gen           func(K) (V, error) // 加载函数；MustGet 未命中时调用
+	Gen           func(K) (V, error) // 加载函数；MustGet 未命中时调用。失败须自行清理半成品并返回零值 + err
 }
 ```
 
@@ -162,6 +163,10 @@ use(p)
 「查表 → 加锁 → 双重检查 → 加载 → 写回」样板代码。注意它的 `Gen` 在**锁外**执行——
 高并发同时未命中时会各自触发加载（缓存击穿），只是靠双重检查保证不重复写入。若需合并并发
 加载，再套一层 `singleflight`。
+
+`Gen` 返回 error 时，`MustGet` 返回零值 value + err（`Gen` 须自行清理失败路径的半成品）。
+并发未命中时被双重检查丢弃的加载结果只释放资源（`Close`），**不触发 `OnEvict`**——`OnEvict`
+严格限定为真实驱逐（到期/删除/覆盖/`Stop`）的通知，避免误报「key 被驱逐」。
 
 ## 并发模型与性能
 
